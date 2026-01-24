@@ -203,6 +203,23 @@ OpenCode 基于 VS Code 架构构建，同样支持 MCP 服务器。
 - 堆栈导航和检查
 - 事后调试支持
 
+## 成功案例
+
+### 调试 2048 游戏逻辑
+
+使用 python-debugger-mcp 调试 2048 游戏项目，成功发现并修复了一个 bug：
+
+**发现的 Bug**: 在 `game.py` 中，`_check_game_over()` 方法在存在空单元格时直接返回，但忘记将 `game_over` 设为 False。这导致游戏即使有空单元格也会错误地报告"游戏结束"。
+
+**MCP 如何帮助**:
+1. 使用 `set_breakpoint()` 设置断点检查游戏状态
+2. 使用 `send_pdb_command("n")` 单步执行代码
+3. 使用 `examine_variable()` 检查变量如 `game.board`
+4. 使用 `clear_breakpoint()` 清除和管理断点
+5. 验证修复是否正确
+
+**结果**: 修复了 bug，现在能正确检测游戏结束状态。
+
 ## 故障排除
 
 ### Claude Code 安装问题

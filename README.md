@@ -205,6 +205,23 @@ Then restart OpenCode to apply changes.
 - Stack navigation and inspection
 - Postmortem debugging support
 
+## Success Stories
+
+### Debugging 2048 Game Logic
+
+Used python-debugger-mcp to debug a 2048 game project and successfully found and fixed a bug:
+
+**Bug Found**: In `game.py`, the `_check_game_over()` method was returning early when empty cells existed, but forgot to set `game_over = False`. This caused the game to incorrectly report "game over" even when empty cells were available.
+
+**How MCP Helped**:
+1. Set breakpoints using `set_breakpoint()` to inspect game state
+2. Step through code with `send_pdb_command("n")`
+3. Examine variables like `game.board` with `examine_variable()`
+4. Clear and manage breakpoints with `clear_breakpoint()`
+5. Verify the fix worked correctly
+
+**Result**: Fixed the bug - now properly detects game over state.
+
 ## Troubleshooting
 
 ### Claude Code Installation Issues
