@@ -5,7 +5,21 @@
 
 python-debugger-mcp 提供通过模型上下文协议 (MCP) 在 Claude 和其他 LLM 中使用 Python 调试器 (pdb) 的工具。这是受 Microsoft 的 [debug-gym](https://microsoft.github.io/debug-gym/) 启发的项目。
 
-Forked from [mcp-pdb](https://github.com/danielgafni/mcp-pdb)。
+基于 [mcp-pdb](https://github.com/danielgafni/mcp-pdb) 的重大增强版本：
+
+| 功能 | mcp-pdb | python-debugger-mcp |
+|------|---------|---------------------|
+| 工具数量 | 16 | **24** |
+| 堆栈导航 | - | navigate_stack, get_stack_trace |
+| 条件断点 | - | set_breakpoint_with_condition |
+| 临时断点 | - | set_temporary_breakpoint |
+| 断点管理 | - | enable_breakpoint, disable_breakpoint, ignore_breakpoint |
+| 变量监视 | - | set_display, list_displays, clear_display |
+| 代码检查 | - | list_source, get_function_args, get_return_value, get_variable_type |
+| 事后调试 | - | enter_postmortem_mode |
+| 测试 | - | 完整的单元测试 |
+| 多语言文档 | - | 英文 + 中文 |
+| IDE 支持 | 有限 | Claude Code, Cursor, OpenCode, Windsurf |
 
 ## ⚠️ 安全警告
 

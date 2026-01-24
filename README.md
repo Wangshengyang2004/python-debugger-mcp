@@ -5,7 +5,21 @@
 
 python-debugger-mcp provides tools for using Python's debugger (pdb) with Claude and other LLMs through the Model Context Protocol (MCP). This was inspired by [debug-gym](https://microsoft.github.io/debug-gym/) by Microsoft, which showed gains in various coding benchmarks by providing a coding agent access to a python debugger.
 
-Forked from [mcp-pdb](https://github.com/danielgafni/mcp-pdb).
+Based on [mcp-pdb](https://github.com/danielgafni/mcp-pdb) with significant enhancements:
+
+| Feature | mcp-pdb | python-debugger-mcp |
+|---------|---------|---------------------|
+| Tools Count | 16 | **24** |
+| Stack Navigation | - | navigate_stack, get_stack_trace |
+| Conditional Breakpoints | - | set_breakpoint_with_condition |
+| Temporary Breakpoints | - | set_temporary_breakpoint |
+| Breakpoint Management | - | enable_breakpoint, disable_breakpoint, ignore_breakpoint |
+| Variable Watch | - | set_display, list_displays, clear_display |
+| Code Inspection | - | list_source, get_function_args, get_return_value, get_variable_type |
+| Postmortem Debugging | - | enter_postmortem_mode |
+| Tests | - | Comprehensive unit tests |
+| Multi-language Docs | - | English + Chinese (README_CN.md) |
+| IDE Support | Limited | Claude Code, Cursor, OpenCode, Windsurf |
 
 [**中文文档**](README_CN.md)
 
