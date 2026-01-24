@@ -1,14 +1,12 @@
-"""Tests for helper functions in mcp_pdb.main."""
+"""Tests for helper functions in python_debugger_mcp.main."""
 
 import os
 import sys
-import tempfile
-from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from mcp_pdb.main import find_project_root, find_venv_details, sanitize_arguments
+from python_debugger_mcp.main import find_project_root, find_venv_details, sanitize_arguments
 
 
 class TestFindProjectRoot:

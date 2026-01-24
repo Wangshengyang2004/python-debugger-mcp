@@ -1,10 +1,10 @@
-# mcp-pdb Development Guide
+# python-debugger-mcp Development Guide
 
 ## Project Overview
 This project is a debugging tool that integrates PDB (Python Debugger) with the MCP (Multi-modal Chat Protocol) framework. It allows interactive debugging of Python code through a chat interface.
 
 ## Build Commands
-- Run the server: `uv run mcp-pdb`
+- Run the server: `uv run python-debugger-mcp`
 - Lint: `uv run ruff check`
 - Type check: `uv run pyright`
 
@@ -20,15 +20,17 @@ This project is a debugging tool that integrates PDB (Python Debugger) with the 
 - When testing with pytest, use `uv run pytest --pdb <file_path>`
 
 ### Project Structure
-- Main functionality is in `src/mcp_pdb/main.py`
+- Main functionality is in `src/python_debugger_mcp/main.py`
 - The code provides MCP tools for:
   - Starting/stopping debug sessions
-  - Setting/managing breakpoints
-  - Sending commands to PDB
-  - Examining variables
-  - Managing debug status
+  - Setting/managing breakpoints (including conditional and temporary)
+  - Stack navigation
+  - Variable watch (display)
+  - Code inspection
+  - Postmortem debugging
 
 ### Development Notes
 - The project uses the FastMCP framework for building MCP tools
 - Detection of uv environments is done by running `uv tree` in the project directory
 - Breakpoints are tracked across debug sessions
+- Display expressions are tracked during debugging sessions

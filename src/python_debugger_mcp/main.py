@@ -14,7 +14,7 @@ import traceback
 from mcp.server.fastmcp import FastMCP
 
 # Initialize FastMCP server
-mcp = FastMCP("mcp-pdb")
+mcp = FastMCP("python-debugger-mcp")
 
 # --- Global Variables ---
 pdb_process = None
@@ -97,6 +97,7 @@ def send_to_pdb(command, timeout_multiplier=1.0):
             else:
                 timeout = base_timeout * timeout_multiplier
 
+            assert pdb_process.stdin is not None, "stdin should be available for pdb process"
             pdb_process.stdin.write((command + '\n').encode('utf-8'))
             pdb_process.stdin.flush()
             # Wait a bit for command processing. Adjust if needed.
@@ -318,6 +319,7 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
         try: pdb_output_queue.get_nowait()
         except queue.Empty: break
 
+    cmd: list[str] = []  # Initialize before try block to ensure it's always bound
     try:
         # --- Determine Execution Environment ---
         use_uv = False
@@ -341,7 +343,6 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
             venv_python_path, venv_bin_dir = find_venv_details(project_root)
 
         # --- Prepare Command and Subprocess Environment ---
-        cmd = []
         # Start with a clean environment copy, modify selectively
         env = os.environ.copy()
 
@@ -379,6 +380,7 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
             cmd = base_cmd + [rel_file_path] + parsed_args
         elif venv_python_path:
             print(f"Using venv Python: {venv_python_path}")
+            assert venv_bin_dir is not None, "venv_bin_dir should not be None when venv_python_path is set"
             venv_dir = os.path.dirname(os.path.dirname(venv_bin_dir)) # Get actual venv root
             env['VIRTUAL_ENV'] = venv_dir
             env['PATH'] = f"{venv_bin_dir}{os.pathsep}{env.get('PATH', '')}"
@@ -532,7 +534,8 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
 
     except FileNotFoundError as e:
          pdb_running = False
-         return f"Error starting debugging session: Command not found ({e.filename}). Is '{cmd[0]}' installed and in the correct PATH (system or venv)?\n{traceback.format_exc()}"
+         cmd_name = cmd[0] if cmd else 'unknown'
+         return f"Error starting debugging session: Command not found ({e.filename}). Is '{cmd_name}' installed and in the correct PATH (system or venv)?\n{traceback.format_exc()}"
     except Exception as e:
         pdb_running = False
         return f"Error starting debugging session: {str(e)}\n{traceback.format_exc()}"
@@ -961,7 +964,7 @@ def end_debug() -> str:
                     print(f"SIGINT failed: {e}")
 
             # Next try sending quit command for graceful exit
-            if pdb_process.poll() is None:
+            if pdb_process.poll() is None and pdb_process.stdin is not None:
                 try:
                     print("Attempting graceful exit with 'q'...")
                     pdb_process.stdin.write(b'q\n')
@@ -1010,6 +1013,338 @@ def end_debug() -> str:
 
     print("Debugging session ended and state cleared.")
     return result_message
+
+
+# --- Stack Navigation Tools ---
+
+@mcp.tool()
+def navigate_stack(direction: str, count: int = 1) -> str:
+    """Move up or down the stack trace.
+
+    Args:
+        direction: 'up' to move to higher stack frame (caller), 'down' to move to lower stack frame (callee)
+        count: Number of frames to move (default: 1)
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    direction = direction.lower()
+    if direction not in ('up', 'down'):
+        return "Invalid direction. Use 'up' or 'down'."
+
+    command = f"{direction} {count}"
+    response = send_to_pdb(command)
+
+    return f"--- Stack Navigation ({direction} {count}) ---\n{response}"
+
+
+@mcp.tool()
+def get_stack_trace() -> str:
+    """Print the current stack trace. Equivalent to PDB 'where' or 'w' command."""
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    response = send_to_pdb("where")
+    return f"--- Stack Trace ---\n{response}"
+
+
+# --- Enhanced Breakpoint Tools ---
+
+@mcp.tool()
+def set_breakpoint_with_condition(file_path: str, line_number: int, condition: str) -> str:
+    """Set a breakpoint at a specific line with a condition.
+
+    Args:
+        file_path: Path to the file (relative or absolute).
+        line_number: Line number for the breakpoint.
+        condition: Python expression that must be True for the breakpoint to trigger.
+    """
+    global breakpoints, current_project_root
+
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+    if not current_project_root:
+        return "Error: Project root not identified. Cannot reliably set breakpoint."
+
+    abs_file_path = os.path.abspath(os.path.join(current_project_root, file_path))
+    if not os.path.exists(abs_file_path):
+        abs_file_path = os.path.abspath(file_path)
+        if not os.path.exists(abs_file_path):
+            return f"Error: File not found at '{file_path}'."
+
+    try:
+        rel_file_path = os.path.relpath(abs_file_path, current_project_root)
+        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+    except ValueError:
+        rel_file_path = abs_file_path
+
+    if abs_file_path not in breakpoints:
+        breakpoints[abs_file_path] = {}
+
+    # Format condition for PDB
+    escaped_condition = condition.replace('"', '\\"')
+    command = f"b {rel_file_path}:{line_number} if {escaped_condition}"
+    response = send_to_pdb(command)
+
+    # Verify breakpoint was set
+    if "Breakpoint" in response and str(line_number) in response:
+        match = re.search(r"Breakpoint (\d+) at", response)
+        bp_number = match.group(1) if match else None
+
+        breakpoints[abs_file_path][line_number] = {
+            "command": command,
+            "bp_number": bp_number,
+            "condition": condition
+        }
+        return f"Conditional breakpoint #{bp_number} set (condition: {condition}):\n{response}"
+    else:
+        return f"Failed to set conditional breakpoint. PDB response:\n{response}"
+
+
+@mcp.tool()
+def set_temporary_breakpoint(file_path: str, line_number: int) -> str:
+    """Set a temporary breakpoint that is automatically deleted after first hit.
+
+    Args:
+        file_path: Path to the file (relative or absolute).
+        line_number: Line number for the breakpoint.
+    """
+    global breakpoints, current_project_root
+
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+    if not current_project_root:
+        return "Error: Project root not identified."
+
+    abs_file_path = os.path.abspath(os.path.join(current_project_root, file_path))
+    if not os.path.exists(abs_file_path):
+        return f"Error: File not found at '{file_path}'."
+
+    try:
+        rel_file_path = os.path.relpath(abs_file_path, current_project_root)
+        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+    except ValueError:
+        rel_file_path = abs_file_path
+
+    command = f"tbreak {rel_file_path}:{line_number}"
+    response = send_to_pdb(command)
+
+    if "Breakpoint" in response:
+        match = re.search(r"Breakpoint (\d+) at", response)
+        bp_number = match.group(1) if match else None
+
+        if abs_file_path not in breakpoints:
+            breakpoints[abs_file_path] = {}
+        breakpoints[abs_file_path][line_number] = {
+            "command": command,
+            "bp_number": bp_number,
+            "temporary": True
+        }
+        return f"Temporary breakpoint #{bp_number} set:\n{response}"
+    else:
+        return f"Failed to set temporary breakpoint. PDB response:\n{response}"
+
+
+@mcp.tool()
+def enable_breakpoint(bp_number: int) -> str:
+    """Enable a disabled breakpoint.
+
+    Args:
+        bp_number: The breakpoint number to enable.
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    command = f"enable {bp_number}"
+    response = send_to_pdb(command)
+    return f"--- Enable Breakpoint #{bp_number} ---\n{response}"
+
+
+@mcp.tool()
+def disable_breakpoint(bp_number: int) -> str:
+    """Disable a breakpoint (without deleting it).
+
+    Args:
+        bp_number: The breakpoint number to disable.
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    command = f"disable {bp_number}"
+    response = send_to_pdb(command)
+    return f"--- Disable Breakpoint #{bp_number} ---\n{response}"
+
+
+@mcp.tool()
+def ignore_breakpoint(bp_number: int, count: int) -> str:
+    """Ignore a breakpoint for a specified number of hits.
+
+    Args:
+        bp_number: The breakpoint number to ignore.
+        count: Number of hits to ignore before the breakpoint activates.
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    command = f"ignore {bp_number} {count}"
+    response = send_to_pdb(command)
+    return f"--- Ignore Breakpoint #{bp_number} for {count} hits ---\n{response}"
+
+
+# --- Variable Watch Tools ---
+
+# Track displays globally
+displays = {}  # {display_id: expression}
+
+@mcp.tool()
+def set_display(expression: str) -> str:
+    """Add an expression to be automatically displayed at each breakpoint.
+
+    Args:
+        expression: Python expression to watch (e.g., 'my_var', 'len(my_list)', 'self.x').
+    """
+    global displays
+
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    # Generate a simple ID for the display
+    display_id = len(displays) + 1
+    displays[display_id] = expression
+
+    command = f"display {expression}"
+    response = send_to_pdb(command)
+
+    return f"--- Set Display #{display_id} ({expression}) ---\n{response}"
+
+
+@mcp.tool()
+def list_displays() -> str:
+    """List all active display expressions."""
+    global displays
+
+    if not displays:
+        return "No display expressions are currently set."
+
+    display_list = []
+    for display_id, expression in displays.items():
+        display_list.append(f"#{display_id}: {expression}")
+
+    return "--- Active Displays ---\n" + "\n".join(display_list)
+
+
+@mcp.tool()
+def clear_display(expression_or_id: str) -> str:
+    """Remove a display expression by ID or expression string.
+
+    Args:
+        expression_or_id: The display ID (number) or expression to remove.
+    """
+    global displays
+
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    # Try to parse as ID first
+    try:
+        display_id = int(expression_or_id)
+        if display_id in displays:
+            expression = displays.pop(display_id)
+            command = f"undisplay {display_id}"
+            response = send_to_pdb(command)
+            return f"--- Cleared Display #{display_id} ({expression}) ---\n{response}"
+        else:
+            return f"Display ID #{display_id} not found."
+    except ValueError:
+        # Treat as expression string
+        command = f"undisplay {expression_or_id}"
+        response = send_to_pdb(command)
+
+        # Also remove from our tracking if found
+        for display_id, expression in list(displays.items()):
+            if expression == expression_or_id:
+                del displays[display_id]
+                break
+
+        return f"--- Cleared Display ({expression_or_id}) ---\n{response}"
+
+
+# --- Code Inspection Tools ---
+
+@mcp.tool()
+def list_source(long_list: bool = False) -> str:
+    """List source code around the current breakpoint.
+
+    Args:
+        long_list: If True, list more context (equivalent to 'll'); otherwise use 'l'.
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    command = "ll" if long_list else "l"
+    response = send_to_pdb(command)
+    return f"--- Source Code ---\n{response}"
+
+
+@mcp.tool()
+def get_function_args() -> str:
+    """Print the arguments of the current function frame."""
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    response = send_to_pdb("a")
+    return f"--- Function Arguments ---\n{response}"
+
+
+@mcp.tool()
+def get_return_value() -> str:
+    """Print the return value of the last function call (only works after 'next' or 'step')."""
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    response = send_to_pdb("retval")
+    return f"--- Return Value ---\n{response}"
+
+
+@mcp.tool()
+def get_variable_type(expression: str) -> str:
+    """Print the type of a variable or expression.
+
+    Args:
+        expression: The variable or expression to check.
+    """
+    if not pdb_running:
+        return "No active debugging session. Use start_debug first."
+
+    command = f"whatis {expression}"
+    response = send_to_pdb(command)
+    return f"--- Type of '{expression}' ---\n{response}"
+
+
+# --- Postmortem Debugging Tool ---
+
+@mcp.tool()
+def enter_postmortem_mode() -> str:
+    """Enter postmortem debugging mode for the last unhandled exception.
+
+    This allows you to debug an exception after it occurred.
+    """
+    global pdb_running, pdb_process
+
+    if pdb_running:
+        return "A debugging session is already running. End it first with end_debug()."
+
+    # Check if we have a traceback file or use sys.last_traceback
+    # For true postmortem, we need to set up pdb.pm() or use the traceback module
+    return ("Postmortem debugging requires a traceback.\n"
+            "To debug an exception:\n"
+            "1. Run your code with: python -m pdb your_script.py\n"
+            "2. Or add to your code:\n"
+            "   import pdb; pdb.pm()\n"
+            "3. After an unhandled exception, pdb will automatically enter debugging mode.\n\n"
+            "Note: This MCP server provides interactive debugging via start_debug(). "
+            "For postmortem debugging, consider wrapping your code with try/except and "
+            "calling start_debug() with the appropriate file.")
 
 # --- Cleanup on Exit ---
 
