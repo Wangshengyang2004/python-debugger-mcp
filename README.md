@@ -7,6 +7,8 @@ python-debugger-mcp provides tools for using Python's debugger (pdb) with Claude
 
 Forked from [mcp-pdb](https://github.com/danielgafni/mcp-pdb).
 
+[**中文文档**](README_CN.md)
+
 ## ⚠️ Security Warning
 
 This tool executes Python code through the debugger. Use in trusted environments only.
