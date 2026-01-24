@@ -43,6 +43,85 @@ claude mcp add python-debugger-mcp -- uv run --python 3.13 --with git+https://gi
 }
 ```
 
+### Cursor
+
+**方法 1：使用 mcp.json（推荐）**
+
+创建或编辑 `~/.cursor/mcp.json`（全局）或 `.cursor/mcp.json`（项目专用）：
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+然后重启 Cursor 以加载 MCP 服务器。
+
+**方法 2：一键安装**
+
+打开 Cursor 设置 > MCP > 点击 "+ Add MCP Server" 并粘贴：
+```
+uv run --with git+https://github.com/Wangshengyang2004/python-debugger-mcp python-debugger-mcp
+```
+
+### OpenCode
+
+OpenCode 基于 VS Code 架构构建，同样支持 MCP 服务器。
+
+**方法 1：使用 Settings JSON**
+
+1. 打开命令面板（Ctrl+Shift+P）
+2. 运行 "首选项: 打开设置 (JSON)"
+3. 添加以下配置：
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+**方法 2：使用 .mcp.json 文件**
+
+创建 `~/.opencode/mcp.json` 用于全局设置：
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+然后重启 OpenCode 以应用更改。
+
 ## 可用工具
 
 ### 会话管理

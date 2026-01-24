@@ -45,6 +45,85 @@ claude mcp add python-debugger-mcp -- uv run --python 3.13 --with git+https://gi
 }
 ```
 
+### Cursor
+
+**Method 1: Using mcp.json (Recommended)**
+
+Create or edit `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-specific):
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+Then restart Cursor to load the MCP server.
+
+**Method 2: One-click Install**
+
+Open Cursor Settings > MCP > Click "+ Add MCP Server" and paste:
+```
+uv run --with git+https://github.com/Wangshengyang2004/python-debugger-mcp python-debugger-mcp
+```
+
+### OpenCode
+
+OpenCode is built on VS Code architecture and supports MCP servers similarly.
+
+**Method 1: Using Settings JSON**
+
+1. Open Command Palette (Ctrl+Shift+P)
+2. Run "Preferences: Open Settings (JSON)"
+3. Add the following configuration:
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+**Method 2: Using .mcp.json file**
+
+Create `~/.opencode/mcp.json` for global settings:
+
+```json
+{
+  "mcpServers": {
+    "python-debugger-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/Wangshengyang2004/python-debugger-mcp",
+        "python-debugger-mcp"
+      ]
+    }
+  }
+}
+```
+
+Then restart OpenCode to apply changes.
+
 ## Available Tools
 
 ### Session Management
