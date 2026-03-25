@@ -18,8 +18,10 @@ mcp = FastMCP("python-debugger-mcp")
 
 # --- Global Variables ---
 pdb_process = None
-pdb_output_queue = queue.Queue()
+pdb_output_queue = queue.Queue()  # items: ("text", str) | ("prompt", None) | ("eof", None)
 pdb_running = False
+pdb_at_prompt = False             # True when PDB is waiting at the (Pdb) prompt
+pdb_command_lock = threading.Lock()  # Serializes stdin writes and response reads
 current_file = None           # Absolute path of the file being debugged
 current_project_root = None # Root directory of the project being debugged
 current_args = ""             # Additional args passed to the script/pytest
@@ -29,110 +31,164 @@ output_thread = None          # Thread object for reading output
 
 # --- Helper Functions ---
 
+_PDB_PROMPT = b"(Pdb) "
+_PROMPT_KEEP = len(_PDB_PROMPT) - 1  # bytes to keep when prompt may be split across chunks
+
+
+def _find_prompt(buf: bytes) -> int:
+    """Return the byte offset of the start of a (Pdb) prompt in buf, or -1."""
+    if buf.startswith(_PDB_PROMPT):
+        return 0
+    pos = buf.find(b"\n" + _PDB_PROMPT)
+    return -1 if pos < 0 else pos + 1
+
+
 def read_pdb_output(process, output_queue):
-    """Read output from the pdb process and put it in the queue."""
+    """Read output from the pdb process and emit typed events into the queue.
+
+    Events: ("text", str) for normal output lines,
+            ("prompt", None) when PDB is waiting at the (Pdb) prompt,
+            ("eof", None) when the process stdout closes.
+    """
+    global pdb_at_prompt
+    buf = b""
     try:
-        # Use iter() with readline to avoid blocking readline() indefinitely
-        # if the process exits unexpectedly or stdout closes.
-        for line_bytes in iter(process.stdout.readline, b''):
-            output_queue.put(line_bytes.decode('utf-8', errors='replace').rstrip())
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+
+            while True:
+                prompt_pos = _find_prompt(buf)
+                if prompt_pos >= 0:
+                    # Emit any text before the prompt
+                    if prompt_pos > 0:
+                        text = buf[:prompt_pos].decode("utf-8", errors="replace")
+                        output_queue.put(("text", text))
+                    output_queue.put(("prompt", None))
+                    pdb_at_prompt = True
+                    buf = buf[prompt_pos + len(_PDB_PROMPT):]
+                    # There may be more output after the prompt (e.g. multi-prompt)
+                    continue
+
+                # No complete prompt yet — emit safe prefix, keep possible partial prompt
+                if len(buf) > _PROMPT_KEEP:
+                    safe = len(buf) - _PROMPT_KEEP
+                    text = buf[:safe].decode("utf-8", errors="replace")
+                    output_queue.put(("text", text))
+                    buf = buf[safe:]
+                break
+
     except ValueError:
-        # Handle ValueError if stdout is closed prematurely (e.g., process killed)
         print("PDB output reader: ValueError (stdout likely closed).", file=sys.stderr)
     except Exception as e:
         print(f"PDB output reader: Unexpected error: {e}", file=sys.stderr)
-        # Optionally log traceback here if needed
     finally:
-        # Ensure stdout is closed if loop finishes normally or breaks
+        if buf:
+            output_queue.put(("text", buf.decode("utf-8", errors="replace")))
+        output_queue.put(("eof", None))
         if process and process.stdout and not process.stdout.closed:
-             try:
-                 process.stdout.close()
-             except Exception as e:
-                 print(f"PDB output reader: Error closing stdout: {e}", file=sys.stderr)
+            try:
+                process.stdout.close()
+            except Exception as e:
+                print(f"PDB output reader: Error closing stdout: {e}", file=sys.stderr)
         print("PDB output reader thread finished.", file=sys.stderr)
 
 
 def get_pdb_output(timeout=0.5):
-    """Get accumulated output from the pdb process queue."""
-    output = []
+    """Collect output until a prompt event or timeout (used for startup only).
+
+    For normal command/response flow use _wait_for_prompt() instead.
+    This timeout-based variant is kept for the initial startup phase where
+    we don't know how much output to expect before the first prompt.
+    """
+    parts = []
     start_time = time.monotonic()
     while True:
+        remaining = timeout - (time.monotonic() - start_time)
+        if remaining <= 0:
+            break
         try:
-            # Calculate remaining time
-            remaining_time = timeout - (time.monotonic() - start_time)
-            if remaining_time <= 0:
-                break
-            line = pdb_output_queue.get(timeout=remaining_time)
-            output.append(line)
-            # Heuristic: If we see the pdb prompt, we likely have the main response
-            # Be careful as some commands might produce output containing (Pdb)
-            # Let's rely more on the timeout for now, but keep this in mind.
-            if line.strip().endswith('(Pdb)'):
-                break
+            kind, payload = pdb_output_queue.get(timeout=remaining)
         except queue.Empty:
-            break # Timeout reached
-    return '\n'.join(output)
+            break
+        if kind == "text":
+            parts.append(payload)
+        elif kind == "prompt":
+            break
+        elif kind == "eof":
+            break
+    return "".join(parts)
+
+
+def _wait_for_prompt() -> tuple[str, bool]:
+    """Block until a prompt or eof event, collecting all text in between.
+
+    Returns (output_text, saw_prompt). Uses a short poll interval so we
+    can detect process exit without blocking forever.
+    """
+    parts = []
+    while True:
+        try:
+            kind, payload = pdb_output_queue.get(timeout=0.1)
+        except queue.Empty:
+            if pdb_process and pdb_process.poll() is not None:
+                return "".join(parts), False
+            continue
+        if kind == "text":
+            parts.append(payload)
+        elif kind == "prompt":
+            return "".join(parts), True
+        elif kind == "eof":
+            return "".join(parts), False
 
 
 def send_to_pdb(command, timeout_multiplier=1.0):
-    """Send a command to the pdb process and get its response.
+    """Send a command to the pdb process and wait for the next prompt.
 
-    Args:
-        command: The PDB command to send
-        timeout_multiplier: Multiplier to adjust timeout for complex commands
+    Uses prompt-event framing instead of a fixed timeout, so commands like
+    'continue' that take seconds or minutes to reach the next breakpoint work
+    correctly without output bleeding into the next call.
+
+    timeout_multiplier is kept for API compatibility but no longer affects
+    command/response framing (only the startup get_pdb_output still uses timeouts).
     """
-    global pdb_process, pdb_running
+    global pdb_process, pdb_running, pdb_at_prompt
 
-    if pdb_process and pdb_process.poll() is None:
-        # Clear queue before sending command to get only relevant output
-        while not pdb_output_queue.empty():
-            try: pdb_output_queue.get_nowait()
-            except queue.Empty: break
+    if not (pdb_process and pdb_process.poll() is None):
+        if pdb_running:
+            pdb_running = False
+            final_output, _ = _wait_for_prompt()
+            return f"No active pdb process (it terminated).\nFinal Output:\n{final_output}"
+        return "No active pdb process."
 
+    with pdb_command_lock:
         try:
-            # Determine appropriate timeout based on command type
-            base_timeout = 1.5
-            if command.strip().lower() in ('c', 'continue', 'r', 'run', 'until', 'unt'):
-                timeout = base_timeout * 3 * timeout_multiplier
-            else:
-                timeout = base_timeout * timeout_multiplier
-
             assert pdb_process.stdin is not None, "stdin should be available for pdb process"
+            pdb_at_prompt = False
             pdb_process.stdin.write((command + '\n').encode('utf-8'))
             pdb_process.stdin.flush()
-            # Wait a bit for command processing. Adjust if needed.
-            output = get_pdb_output(timeout=timeout) # Adjusted timeout for commands
 
-            # Check if process ended right after the command
-            if pdb_process.poll() is not None:
-                 pdb_running = False
-                 # Try to get any final output
-                 final_output = get_pdb_output(timeout=0.1)
-                 return f"Command output:\n{output}\n{final_output}\n\n*** The debugging session has ended. ***"
+            output, saw_prompt = _wait_for_prompt()
+
+            if not saw_prompt:
+                pdb_running = False
+                return f"{output}\n\n*** The debugging session has ended. ***"
 
             return output
 
         except (OSError, BrokenPipeError) as e:
-             print(f"Error writing to PDB stdin: {e}", file=sys.stderr)
-             pdb_running = False
-             # Try to get final output
-             final_output = get_pdb_output(timeout=0.1)
-             if pdb_process:
-                 pdb_process.terminate() # Ensure process is stopped
-                 pdb_process.wait(timeout=0.5)
-             return f"Error communicating with PDB: {e}\nFinal Output:\n{final_output}\n\n*** The debugging session has likely ended. ***"
+            print(f"Error writing to PDB stdin: {e}", file=sys.stderr)
+            pdb_running = False
+            if pdb_process:
+                pdb_process.terminate()
+                pdb_process.wait(timeout=0.5)
+            return f"Error communicating with PDB: {e}\n\n*** The debugging session has likely ended. ***"
         except Exception as e:
             print(f"Unexpected error in send_to_pdb: {e}", file=sys.stderr)
             pdb_running = False
             return f"Unexpected error sending command: {e}"
-
-    elif pdb_running:
-        # Process exists but poll() is not None, means it terminated
-        pdb_running = False
-        final_output = get_pdb_output(timeout=0.1)
-        return f"No active pdb process (it terminated).\nFinal Output:\n{final_output}"
-    else:
-        return "No active pdb process."
 
 
 def find_project_root(start_path):
@@ -300,24 +356,19 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
     file_dir = os.path.dirname(abs_file_path)
     project_root = find_project_root(file_dir)
 
-    # --- Update Global State ---
-    current_project_root = project_root
-    current_file = abs_file_path
-    current_args = args
-    current_use_pytest = use_pytest
+    # Resolve to absolute path now; global state is updated only after successful start
+    resolved_file = os.path.abspath(abs_file_path)
 
     # Store original working directory before changing
     original_working_dir = os.getcwd()
     print(f"Original working directory: {original_working_dir}")
 
-    # Initialize breakpoints structure for this file if new
-    if current_file not in breakpoints:
-        breakpoints[current_file] = {}
-
     # Clear the output queue rigorously
     while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
+        try:
+            pdb_output_queue.get_nowait()
+        except queue.Empty:
+            break
 
     cmd: list[str] = []  # Initialize before try block to ensure it's always bound
     try:
@@ -338,9 +389,8 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
                  # We'll let `uv run` determine if it's actually a uv project.
                  use_uv = True # Tentatively true
 
-        if not use_uv:
-            # Look for a standard venv if uv isn't detected/used
-            venv_python_path, venv_bin_dir = find_venv_details(project_root)
+        # Always resolve venv details upfront so we can fall back if uv fails
+        venv_python_path, venv_bin_dir = find_venv_details(project_root)
 
         # --- Prepare Command and Subprocess Environment ---
         # Start with a clean environment copy, modify selectively
@@ -381,7 +431,7 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
         elif venv_python_path:
             print(f"Using venv Python: {venv_python_path}")
             assert venv_bin_dir is not None, "venv_bin_dir should not be None when venv_python_path is set"
-            venv_dir = os.path.dirname(os.path.dirname(venv_bin_dir)) # Get actual venv root
+            venv_dir = os.path.dirname(venv_bin_dir)  # bin/ → venv root
             env['VIRTUAL_ENV'] = venv_dir
             env['PATH'] = f"{venv_bin_dir}{os.pathsep}{env.get('PATH', '')}"
             env.pop('PYTHONHOME', None)
@@ -398,7 +448,7 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
                 if not os.path.exists(pytest_exe):
                     # Try finding via the venv python itself
                     try:
-                        result = subprocess.run([venv_python_path, "-m", "pytest", "--version"], capture_output=True, text=True, check=True, cwd=project_root, env=env)
+                        subprocess.run([venv_python_path, "-m", "pytest", "--version"], capture_output=True, text=True, check=True, cwd=project_root, env=env)
                         print(f"Found pytest via '{venv_python_path} -m pytest'")
                         cmd = [venv_python_path, "-m", "pytest", "--pdb", "-s", "--pdbcls=pdb:Pdb", rel_file_path] + parsed_args
                     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -428,10 +478,13 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
         print(f"Using VIRTUAL_ENV: {env.get('VIRTUAL_ENV', 'Not Set')}")
         # print(f"Using PATH: {env.get('PATH', 'Not Set')}") # Can be very long
 
-        # Ensure previous thread is not running (important for restarts)
+        # Join the previous output thread before launching a new process.
+        # The old readline-blocking concern no longer applies since we use
+        # chunk-based reading; the thread exits as soon as stdout closes.
         if output_thread and output_thread.is_alive():
-             print("Warning: Previous output thread was still alive.", file=sys.stderr)
-             # Attempting to join might hang if readline blocks, so we just detach.
+            output_thread.join(timeout=0.5)
+            if output_thread.is_alive():
+                print("Warning: Previous output thread did not finish cleanly.", file=sys.stderr)
 
         pdb_process = subprocess.Popen(
             cmd,
@@ -453,23 +506,81 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
         output_thread.start()
 
         pdb_running = True # Set running state *before* waiting for output
+        # --- Update Global State (only after process successfully started) ---
+        current_project_root = project_root
+        current_file = resolved_file
+        current_args = args
+        current_use_pytest = use_pytest
+        # Initialize breakpoints entry for this file if new (after successful start)
+        if resolved_file not in breakpoints:
+            breakpoints[resolved_file] = {}
 
         # --- Wait for Initial Output & Verify Start ---
         print("Waiting for PDB to start...")
         initial_output = get_pdb_output(timeout=3.0) # Longer timeout for potentially slow starts/imports
 
-        # Check if process died immediately
+        # Check if process died immediately — if uv failed, try venv fallback
         if pdb_process.poll() is not None:
              exit_code = pdb_process.poll()
              pdb_running = False
-             # Attempt to get any remaining output directly if thread missed it
              final_out_bytes, _ = pdb_process.communicate()
              final_out_str = final_out_bytes.decode('utf-8', errors='replace')
-             full_output = initial_output + "\n" + final_out_str.strip()
-             return (f"Error: PDB process exited immediately (Code: {exit_code}). "
-                     f"Command: {' '.join(map(shlex.quote, cmd))}\n"
-                     f"Working Dir: {project_root}\n"
-                     f"Output:\n---\n{full_output}\n---")
+             uv_error_output = initial_output + "\n" + final_out_str.strip()
+
+             # Attempt venv fallback if uv was used and a venv is available
+             if use_uv and venv_python_path:
+                 print(f"uv failed (exit {exit_code}), falling back to venv: {venv_python_path}", file=sys.stderr)
+                 assert venv_bin_dir is not None
+                 venv_dir = os.path.dirname(venv_bin_dir)
+                 fallback_env = os.environ.copy()
+                 fallback_env['VIRTUAL_ENV'] = venv_dir
+                 fallback_env['PATH'] = f"{venv_bin_dir}{os.pathsep}{fallback_env.get('PATH', '')}"
+                 fallback_env.pop('PYTHONHOME', None)
+                 fallback_env['PYTHONPATH'] = f"{project_root}{os.pathsep}{fallback_env.get('PYTHONPATH', '')}"
+                 fallback_env['PYTHONUNBUFFERED'] = '1'
+                 if use_pytest:
+                     fallback_cmd = [venv_python_path, "-m", "pytest", "--pdb", "-s", "--pdbcls=pdb:Pdb", rel_file_path] + parsed_args
+                 else:
+                     fallback_cmd = [venv_python_path, "-m", "pdb", rel_file_path] + parsed_args
+
+                 # Drain queue and join old thread before retry
+                 while not pdb_output_queue.empty():
+                     try:
+                         pdb_output_queue.get_nowait()
+                     except queue.Empty:
+                         break
+                 if output_thread and output_thread.is_alive():
+                     output_thread.join(timeout=0.5)
+
+                 print(f"Fallback command: {' '.join(map(shlex.quote, fallback_cmd))}")
+                 pdb_process = subprocess.Popen(
+                     fallback_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, text=False, cwd=project_root,
+                     env=fallback_env, bufsize=0
+                 )
+                 output_thread = threading.Thread(
+                     target=read_pdb_output, args=(pdb_process, pdb_output_queue), daemon=True
+                 )
+                 output_thread.start()
+                 pdb_running = True
+                 current_project_root = project_root
+                 current_file = resolved_file
+                 current_args = args
+                 current_use_pytest = use_pytest
+                 if resolved_file not in breakpoints:
+                     breakpoints[resolved_file] = {}
+                 initial_output = get_pdb_output(timeout=3.0)
+                 if pdb_process.poll() is not None:
+                     pdb_running = False
+                     return (f"Error: uv failed and venv fallback also failed.\n"
+                             f"uv output:\n---\n{uv_error_output}\n---\n"
+                             f"venv output:\n---\n{initial_output}\n---")
+                 # Continue with fallback session
+             else:
+                 return (f"Error: PDB process exited immediately (Code: {exit_code}). "
+                         f"Command: {' '.join(map(shlex.quote, cmd))}\n"
+                         f"Working Dir: {project_root}\n"
+                         f"Output:\n---\n{uv_error_output}\n---")
 
         # Check for typical PDB prompt indicators
         # Needs to be somewhat lenient as initial output varies (e.g., pytest header)
@@ -498,35 +609,50 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
 
         # --- Restore Breakpoints ---
         restored_bps_output = ""
-        if current_file in breakpoints and breakpoints[current_file]:
-            print(f"Restoring {len(breakpoints[current_file])} breakpoints for {rel_file_path}...")
-            # Use relative path for consistency in breakpoint commands
-            try:
-                bp_rel_path = os.path.relpath(current_file, project_root)
-                if bp_rel_path == '.': bp_rel_path = os.path.basename(current_file)
-            except ValueError:
-                bp_rel_path = current_file # Fallback
-
+        if breakpoints:
+            print(f"Restoring breakpoints across {len(breakpoints)} file(s)...")
             restored_bps_output += "\n--- Restoring Breakpoints ---\n"
-            # Sort by line number for clarity
-            for line_num in sorted(breakpoints[current_file].keys()):
-                bp_command_rel = f"b {bp_rel_path}:{line_num}"
-                print(f"Sending restore cmd: {bp_command_rel}")
-                restore_out = send_to_pdb(bp_command_rel)
-                restored_bps_output += f"Set {bp_rel_path}:{line_num}: {restore_out or '[No Response]'}\n"
+            for bp_abs_path, bp_lines in breakpoints.items():
+                if not bp_lines:
+                    continue
+                try:
+                    bp_rel_path = os.path.relpath(bp_abs_path, project_root)
+                    if bp_rel_path == '.':
+                        bp_rel_path = os.path.basename(bp_abs_path)
+                except ValueError:
+                    bp_rel_path = bp_abs_path  # Fallback
 
-                # Extract and update BP number if available
-                match = re.search(r"Breakpoint (\d+) at", restore_out)
-                if match:
-                    bp_data = breakpoints[current_file][line_num]
-                    if isinstance(bp_data, dict):
-                        bp_data["bp_number"] = match.group(1)
+                for line_num in sorted(bp_lines.keys()):
+                    bp_data = bp_lines[line_num]
+                    if isinstance(bp_data, dict) and bp_data.get("temporary"):
+                        bp_command_rel = f"tbreak {bp_rel_path}:{line_num}"
+                    elif isinstance(bp_data, dict) and bp_data.get("condition"):
+                        bp_command_rel = f"b {bp_rel_path}:{line_num}, {bp_data['condition']}"
                     else:
-                        # Backward compatibility with older format
-                        breakpoints[current_file][line_num] = {
-                            "command": bp_data,
-                            "bp_number": match.group(1)
-                        }
+                        bp_command_rel = f"b {bp_rel_path}:{line_num}"
+                    print(f"Sending restore cmd: {bp_command_rel}")
+                    restore_out = send_to_pdb(bp_command_rel)
+                    restored_bps_output += f"Set {bp_rel_path}:{line_num}: {restore_out or '[No Response]'}\n"
+
+                    # Extract and update BP number if available
+                    match = re.search(r"Breakpoint (\d+) at", restore_out)
+                    if match:
+                        new_bp_num = match.group(1)
+                        if isinstance(bp_data, dict):
+                            bp_data["bp_number"] = new_bp_num
+                            # Replay disabled state
+                            if bp_data.get("enabled") is False:
+                                send_to_pdb(f"disable {new_bp_num}")
+                            # Replay ignore count
+                            ignore_count = bp_data.get("ignore_count", 0)
+                            if ignore_count > 0:
+                                send_to_pdb(f"ignore {new_bp_num} {ignore_count}")
+                        else:
+                            # Backward compatibility with older format
+                            bp_lines[line_num] = {
+                                "command": bp_data,
+                                "bp_number": new_bp_num
+                            }
 
             restored_bps_output += "--- Breakpoint Restore Complete ---\n"
 
@@ -633,7 +759,8 @@ def set_breakpoint(file_path: str, line_number: int) -> str:
     # Use relative path for the breakpoint command if possible
     try:
         rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+        if rel_file_path == '.':
+            rel_file_path = os.path.basename(abs_file_path)
     except ValueError:
         rel_file_path = abs_file_path # Fallback to absolute
 
@@ -697,13 +824,15 @@ def clear_breakpoint(file_path: str, line_number: int) -> str:
              # If file doesn't exist, we likely don't have a BP anyway
              if abs_file_path in breakpoints and line_number in breakpoints[abs_file_path]:
                   del breakpoints[abs_file_path][line_number]
-                  if not breakpoints[abs_file_path]: del breakpoints[abs_file_path]
+                  if not breakpoints[abs_file_path]:
+                      del breakpoints[abs_file_path]
              return f"Warning: File not found at '{file_path}'. Breakpoint untracked (if it was tracked)."
 
 
     try:
         rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+        if rel_file_path == '.':
+            rel_file_path = os.path.basename(abs_file_path)
     except ValueError:
         rel_file_path = abs_file_path
 
@@ -773,7 +902,8 @@ def list_breakpoints() -> str:
     for abs_path, lines in breakpoints.items():
         try:
             rel_path = os.path.relpath(abs_path, current_project_root)
-            if rel_path == '.': rel_path = os.path.basename(abs_path)
+            if rel_path == '.':
+                rel_path = os.path.basename(abs_path)
         except ValueError:
             rel_path = abs_path # Fallback if not relative
         for line_num in sorted(lines.keys()):
@@ -819,8 +949,10 @@ def restart_debug() -> str:
 
     # Clear the output queue again just in case
     while not pdb_output_queue.empty():
-       try: pdb_output_queue.get_nowait()
-       except queue.Empty: break
+        try:
+            pdb_output_queue.get_nowait()
+        except queue.Empty:
+            break
 
     # Start a new session using stored parameters
     print("Calling start_debug for restart...")
@@ -845,7 +977,8 @@ def examine_variable(variable_name: str) -> str:
     p_command = f"p {variable_name}"
     print(f"Sending command: {p_command}")
     basic_info = send_to_pdb(p_command)
-    if not pdb_running: return f"Session ended after 'p {variable_name}'. Output:\n{basic_info}"
+    if not pdb_running:
+        return f"Session ended after 'p {variable_name}'. Output:\n{basic_info}"
 
     # Type info
     type_command = f"p type({variable_name})"
@@ -898,7 +1031,8 @@ def get_debug_status() -> str:
     for abs_path, lines in breakpoints.items():
          try:
              rel_path = os.path.relpath(abs_path, current_project_root or os.getcwd())
-             if rel_path == '.': rel_path = os.path.basename(abs_path)
+             if rel_path == '.':
+                 rel_path = os.path.basename(abs_path)
          except ValueError:
              rel_path = abs_path
          for line_num in sorted(lines.keys()):
@@ -942,9 +1076,11 @@ def get_debug_status() -> str:
 @mcp.tool()
 def end_debug() -> str:
     """End the current debugging session forcefully."""
-    global pdb_process, pdb_running, output_thread
+    global pdb_process, pdb_running, output_thread, pdb_at_prompt
 
     if not pdb_running and (pdb_process is None or pdb_process.poll() is not None):
+        displays.clear()
+        pdb_at_prompt = False
         return "No active debugging session to end."
 
     print("Ending debugging session...")
@@ -996,6 +1132,7 @@ def end_debug() -> str:
     # Clean up state
     pdb_process = None
     pdb_running = False
+    pdb_at_prompt = False
 
     # Wait briefly for the output thread to potentially finish reading remaining output
     if output_thread and output_thread.is_alive():
@@ -1008,10 +1145,13 @@ def end_debug() -> str:
 
     # Clear the queue one last time
     while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
+        try:
+            pdb_output_queue.get_nowait()
+        except queue.Empty:
+            break
 
     print("Debugging session ended and state cleared.")
+    displays.clear()
     return result_message
 
 
@@ -1074,16 +1214,16 @@ def set_breakpoint_with_condition(file_path: str, line_number: int, condition: s
 
     try:
         rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+        if rel_file_path == '.':
+            rel_file_path = os.path.basename(abs_file_path)
     except ValueError:
         rel_file_path = abs_file_path
 
     if abs_file_path not in breakpoints:
         breakpoints[abs_file_path] = {}
 
-    # Format condition for PDB
-    escaped_condition = condition.replace('"', '\\"')
-    command = f"b {rel_file_path}:{line_number} if {escaped_condition}"
+    # Format condition for PDB: file:line conditional breakpoints use comma syntax
+    command = f"b {rel_file_path}:{line_number}, {condition}"
     response = send_to_pdb(command)
 
     # Verify breakpoint was set
@@ -1122,7 +1262,8 @@ def set_temporary_breakpoint(file_path: str, line_number: int) -> str:
 
     try:
         rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
+        if rel_file_path == '.':
+            rel_file_path = os.path.basename(abs_file_path)
     except ValueError:
         rel_file_path = abs_file_path
 
@@ -1132,14 +1273,9 @@ def set_temporary_breakpoint(file_path: str, line_number: int) -> str:
     if "Breakpoint" in response:
         match = re.search(r"Breakpoint (\d+) at", response)
         bp_number = match.group(1) if match else None
-
-        if abs_file_path not in breakpoints:
-            breakpoints[abs_file_path] = {}
-        breakpoints[abs_file_path][line_number] = {
-            "command": command,
-            "bp_number": bp_number,
-            "temporary": True
-        }
+        # Temporary breakpoints are NOT stored in the persistent breakpoints dict:
+        # they are one-shot and PDB auto-deletes them on first hit, so restoring
+        # them on restart would be incorrect.
         return f"Temporary breakpoint #{bp_number} set:\n{response}"
     else:
         return f"Failed to set temporary breakpoint. PDB response:\n{response}"
@@ -1157,6 +1293,11 @@ def enable_breakpoint(bp_number: int) -> str:
 
     command = f"enable {bp_number}"
     response = send_to_pdb(command)
+    # Update tracked state
+    for bp_lines in breakpoints.values():
+        for bp_data in bp_lines.values():
+            if isinstance(bp_data, dict) and bp_data.get("bp_number") == str(bp_number):
+                bp_data["enabled"] = True
     return f"--- Enable Breakpoint #{bp_number} ---\n{response}"
 
 
@@ -1172,6 +1313,11 @@ def disable_breakpoint(bp_number: int) -> str:
 
     command = f"disable {bp_number}"
     response = send_to_pdb(command)
+    # Update tracked state
+    for bp_lines in breakpoints.values():
+        for bp_data in bp_lines.values():
+            if isinstance(bp_data, dict) and bp_data.get("bp_number") == str(bp_number):
+                bp_data["enabled"] = False
     return f"--- Disable Breakpoint #{bp_number} ---\n{response}"
 
 
@@ -1188,13 +1334,19 @@ def ignore_breakpoint(bp_number: int, count: int) -> str:
 
     command = f"ignore {bp_number} {count}"
     response = send_to_pdb(command)
+    # Update tracked state
+    for bp_lines in breakpoints.values():
+        for bp_data in bp_lines.values():
+            if isinstance(bp_data, dict) and bp_data.get("bp_number") == str(bp_number):
+                bp_data["ignore_count"] = count
     return f"--- Ignore Breakpoint #{bp_number} for {count} hits ---\n{response}"
 
 
 # --- Variable Watch Tools ---
 
-# Track displays globally
-displays = {}  # {display_id: expression}
+# Track displays globally: {expression: pdb_display_id}
+# Using expression as key avoids ID drift when displays are deleted.
+displays = {}  # {expression: pdb_id_str}
 
 @mcp.tool()
 def set_display(expression: str) -> str:
@@ -1208,14 +1360,19 @@ def set_display(expression: str) -> str:
     if not pdb_running:
         return "No active debugging session. Use start_debug first."
 
-    # Generate a simple ID for the display
-    display_id = len(displays) + 1
-    displays[display_id] = expression
-
     command = f"display {expression}"
     response = send_to_pdb(command)
 
-    return f"--- Set Display #{display_id} ({expression}) ---\n{response}"
+    # Parse PDB's real display ID from response (e.g. "display expression" → no ID shown,
+    # but "Displaying expression" or just the expression line; fall back to len+1 if not found)
+    pdb_id_match = re.search(r'^(\d+):', response, re.MULTILINE)
+    pdb_id = pdb_id_match.group(1) if pdb_id_match else str(len(displays) + 1)
+
+    # Only track if PDB accepted it (no error in response)
+    if "error" not in response.lower() and "***" not in response:
+        displays[expression] = pdb_id
+
+    return f"--- Set Display (pdb#{pdb_id}): {expression} ---\n{response}"
 
 
 @mcp.tool()
@@ -1227,8 +1384,8 @@ def list_displays() -> str:
         return "No display expressions are currently set."
 
     display_list = []
-    for display_id, expression in displays.items():
-        display_list.append(f"#{display_id}: {expression}")
+    for expression, pdb_id in displays.items():
+        display_list.append(f"pdb#{pdb_id}: {expression}")
 
     return "--- Active Displays ---\n" + "\n".join(display_list)
 
@@ -1245,28 +1402,28 @@ def clear_display(expression_or_id: str) -> str:
     if not pdb_running:
         return "No active debugging session. Use start_debug first."
 
-    # Try to parse as ID first
+    # Try to resolve a numeric input to an expression via pdb_id lookup
     try:
-        display_id = int(expression_or_id)
-        if display_id in displays:
-            expression = displays.pop(display_id)
-            command = f"undisplay {display_id}"
-            response = send_to_pdb(command)
-            return f"--- Cleared Display #{display_id} ({expression}) ---\n{response}"
+        target_id = str(int(expression_or_id))
+        # Find the expression whose pdb_id matches
+        matched_expr = next((expr for expr, pid in displays.items() if pid == target_id), None)
+        if matched_expr is not None:
+            displays.pop(matched_expr)
+            response = send_to_pdb(f"undisplay {target_id}")
+            return f"--- Cleared Display pdb#{target_id} ({matched_expr}) ---\n{response}"
         else:
-            return f"Display ID #{display_id} not found."
+            return f"Display pdb#{target_id} not found in tracked displays."
     except ValueError:
-        # Treat as expression string
-        command = f"undisplay {expression_or_id}"
-        response = send_to_pdb(command)
+        pass
 
-        # Also remove from our tracking if found
-        for display_id, expression in list(displays.items()):
-            if expression == expression_or_id:
-                del displays[display_id]
-                break
+    # Treat as expression string
+    pdb_id = displays.pop(expression_or_id, None)
+    if pdb_id is not None:
+        response = send_to_pdb(f"undisplay {pdb_id}")
+    else:
+        response = send_to_pdb(f"undisplay {expression_or_id}")
 
-        return f"--- Cleared Display ({expression_or_id}) ---\n{response}"
+    return f"--- Cleared Display ({expression_or_id}) ---\n{response}"
 
 
 # --- Code Inspection Tools ---
