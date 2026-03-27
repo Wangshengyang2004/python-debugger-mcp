@@ -523,8 +523,17 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
         if pdb_process.poll() is not None:
              exit_code = pdb_process.poll()
              pdb_running = False
-             final_out_bytes, _ = pdb_process.communicate()
-             final_out_str = final_out_bytes.decode('utf-8', errors='replace')
+             # Read remaining output from the queue (stdout already consumed by reader thread;
+             # do NOT call communicate() as the reader thread may have closed the pipe).
+             remaining_parts = []
+             while True:
+                 try:
+                     kind, payload = pdb_output_queue.get_nowait()
+                     if kind == "text":
+                         remaining_parts.append(payload)
+                 except queue.Empty:
+                     break
+             final_out_str = "".join(remaining_parts)
              uv_error_output = initial_output + "\n" + final_out_str.strip()
 
              # Attempt venv fallback if uv was used and a venv is available
@@ -1344,9 +1353,11 @@ def ignore_breakpoint(bp_number: int, count: int) -> str:
 
 # --- Variable Watch Tools ---
 
-# Track displays globally: {expression: pdb_display_id}
-# Using expression as key avoids ID drift when displays are deleted.
-displays = {}  # {expression: pdb_id_str}
+# Track displays as a set of expressions. PDB's `display` list output does not
+# include numeric IDs, and `undisplay` accepts expressions directly, so we don't
+# need to track IDs at all.
+displays = set()  # set of expression strings
+
 
 @mcp.tool()
 def set_display(expression: str) -> str:
@@ -1363,67 +1374,37 @@ def set_display(expression: str) -> str:
     command = f"display {expression}"
     response = send_to_pdb(command)
 
-    # Parse PDB's real display ID from response (e.g. "display expression" → no ID shown,
-    # but "Displaying expression" or just the expression line; fall back to len+1 if not found)
-    pdb_id_match = re.search(r'^(\d+):', response, re.MULTILINE)
-    pdb_id = pdb_id_match.group(1) if pdb_id_match else str(len(displays) + 1)
-
-    # Only track if PDB accepted it (no error in response)
     if "error" not in response.lower() and "***" not in response:
-        displays[expression] = pdb_id
+        displays.add(expression)
 
-    return f"--- Set Display (pdb#{pdb_id}): {expression} ---\n{response}"
+    return f"--- Set Display: {expression} ---\n{response}"
 
 
 @mcp.tool()
 def list_displays() -> str:
     """List all active display expressions."""
-    global displays
-
     if not displays:
         return "No display expressions are currently set."
 
-    display_list = []
-    for expression, pdb_id in displays.items():
-        display_list.append(f"pdb#{pdb_id}: {expression}")
-
-    return "--- Active Displays ---\n" + "\n".join(display_list)
+    return "--- Active Displays ---\n" + "\n".join(displays)
 
 
 @mcp.tool()
-def clear_display(expression_or_id: str) -> str:
-    """Remove a display expression by ID or expression string.
+def clear_display(expression: str) -> str:
+    """Remove a display expression.
 
     Args:
-        expression_or_id: The display ID (number) or expression to remove.
+        expression: The expression to remove from the display list.
     """
     global displays
 
     if not pdb_running:
         return "No active debugging session. Use start_debug first."
 
-    # Try to resolve a numeric input to an expression via pdb_id lookup
-    try:
-        target_id = str(int(expression_or_id))
-        # Find the expression whose pdb_id matches
-        matched_expr = next((expr for expr, pid in displays.items() if pid == target_id), None)
-        if matched_expr is not None:
-            displays.pop(matched_expr)
-            response = send_to_pdb(f"undisplay {target_id}")
-            return f"--- Cleared Display pdb#{target_id} ({matched_expr}) ---\n{response}"
-        else:
-            return f"Display pdb#{target_id} not found in tracked displays."
-    except ValueError:
-        pass
+    displays.discard(expression)
+    response = send_to_pdb(f"undisplay {expression}")
 
-    # Treat as expression string
-    pdb_id = displays.pop(expression_or_id, None)
-    if pdb_id is not None:
-        response = send_to_pdb(f"undisplay {pdb_id}")
-    else:
-        response = send_to_pdb(f"undisplay {expression_or_id}")
-
-    return f"--- Cleared Display ({expression_or_id}) ---\n{response}"
+    return f"--- Cleared Display: {expression} ---\n{response}"
 
 
 # --- Code Inspection Tools ---
